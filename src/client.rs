@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -27,14 +27,6 @@ pub struct Args {
     /// Local upstream address, e.g. 127.0.0.1:3000
     #[arg(long)]
     pub local: String,
-    /// Optional fixed subdomain name (else random)
-    #[arg(long)]
-    pub name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CreateReq<'a> {
-    name: Option<&'a str>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -48,13 +40,9 @@ struct CreateResp {
 
 pub async fn run(args: Args) -> Result<()> {
     let create_url = format!("{}/api/tunnels", args.url.trim_end_matches('/'));
-    let body = CreateReq {
-        name: args.name.as_deref(),
-    };
     let resp = reqwest::Client::new()
         .post(&create_url)
         .bearer_auth(&args.secret)
-        .json(&body)
         .send()
         .await
         .context("POST /api/tunnels")?;

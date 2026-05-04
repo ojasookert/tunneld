@@ -205,10 +205,36 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct CreateReq {
-    name: Option<String>,
+static WORDLIST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+const MIN_WORDS: usize = 10240;
+
+fn wordlist() -> &'static [&'static str] {
+    WORDLIST
+        .get_or_init(|| {
+            let words: Vec<&'static str> = include_str!("wordlist.txt")
+                .lines()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .collect();
+            assert!(
+                words.len() >= MIN_WORDS,
+                "embedded wordlist has {} words, need at least {}",
+                words.len(),
+                MIN_WORDS
+            );
+            words
+        })
+        .as_slice()
+}
+
+fn generate_subdomain() -> String {
+    use rand::Rng;
+    let words = wordlist();
+    let mut rng = rand::thread_rng();
+    (0..4)
+        .map(|_| words[rng.gen_range(0..words.len())])
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[derive(Serialize)]
@@ -226,24 +252,20 @@ struct ListItem {
     public_url: String,
 }
 
-async fn create_tunnel(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Option<Json<CreateReq>>,
-) -> Response {
+async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
 
-    let req = body.map(|Json(b)| b).unwrap_or_default();
-    let subdomain = match req.name {
-        Some(n) if is_valid_name(&n) => n,
-        Some(_) => return (StatusCode::BAD_REQUEST, "invalid name").into_response(),
-        None => nanoid::nanoid!(8, &SAFE_ALPHABET),
-    };
-
+    let mut subdomain = generate_subdomain();
+    for _ in 0..8 {
+        if !state.tunnels.contains_key(&subdomain) {
+            break;
+        }
+        subdomain = generate_subdomain();
+    }
     if state.tunnels.contains_key(&subdomain) {
-        return (StatusCode::CONFLICT, "subdomain in use").into_response();
+        return (StatusCode::CONFLICT, "could not allocate subdomain").into_response();
     }
 
     let tunnel_id = Uuid::new_v4();
@@ -278,25 +300,15 @@ async fn create_tunnel(
         .into_response()
 }
 
-const SAFE_ALPHABET: [char; 32] = [
-    '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm',
-    'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0',
-];
-
-fn is_valid_name(n: &str) -> bool {
-    !n.is_empty()
-        && n.len() <= 32
-        && n.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !n.starts_with('-')
-        && !n.ends_with('-')
-}
-
 async fn list_tunnels(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
-    let scheme = state.public_base.split("://").next().unwrap_or("https");
+    let scheme = state
+        .public_base
+        .split_once("://")
+        .map(|s| s.0)
+        .unwrap_or("https");
     let items: Vec<_> = state
         .tunnels
         .iter()
