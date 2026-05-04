@@ -119,6 +119,9 @@ pub async fn run(args: Args) -> Result<()> {
         .precompressed_gzip()
         .append_index_html_on_directories(false);
 
+    use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+    use tracing::Level;
+
     let app = Router::new()
         .route("/api/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/api/tunnels/:id", delete(delete_tunnel))
@@ -126,7 +129,12 @@ pub async fn run(args: Args) -> Result<()> {
         .route("/install", get(install_script))
         .nest_service("/dl", serve_dist)
         .fallback(host_fallback)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state.clone());
 
     let tls_config = tls::server_config(&args.cert_path, &args.key_path)
@@ -168,6 +176,7 @@ async fn handle_data_conn(
     state: Arc<AppState>,
 ) -> Result<()> {
     let _ = sock.set_nodelay(true);
+    tracing::info!(peer = %peer, "data conn accepted");
     let mut tls = acceptor.accept(sock).await.context("tls accept")?;
 
     let prelude = match Prelude::read(&mut tls).await {
@@ -250,19 +259,27 @@ async fn host_fallback(State(state): State<Arc<AppState>>, req: Request<Body>) -
     let domain = state.domain.to_lowercase();
 
     if host == domain {
-        return (StatusCode::NOT_FOUND, "tunneld: unknown path").into_response();
+        return generic_404();
     }
     if let Some(sub) = host.strip_suffix(&format!(".{domain}")) {
         if sub.is_empty() || sub.contains('.') {
-            return (
-                StatusCode::NOT_FOUND,
-                "nested or empty subdomain unsupported",
-            )
-                .into_response();
+            return generic_404();
         }
         return proxy_request(state, sub.to_string(), req).await;
     }
-    (StatusCode::NOT_FOUND, format!("unknown host: {host}")).into_response()
+    generic_404()
+}
+
+fn generic_404() -> Response {
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
+fn generic_502() -> Response {
+    (StatusCode::BAD_GATEWAY, "Bad Gateway").into_response()
+}
+
+fn unauth_as_404() -> Response {
+    generic_404()
 }
 
 fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
@@ -337,7 +354,7 @@ struct ListItem {
 
 async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.secret) {
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+        return unauth_as_404();
     }
 
     let mut subdomain = generate_subdomain();
@@ -382,7 +399,7 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -
 
 async fn list_tunnels(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.secret) {
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+        return unauth_as_404();
     }
     let scheme = state
         .public_base
@@ -407,7 +424,7 @@ async fn delete_tunnel(
     headers: HeaderMap,
 ) -> Response {
     if !check_auth(&headers, &state.secret) {
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+        return unauth_as_404();
     }
     if let Some((_, sub)) = state.by_id.remove(&id) {
         if let Some((_, handle)) = state.tunnels.remove(&sub) {
@@ -419,12 +436,18 @@ async fn delete_tunnel(
 }
 
 async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) -> Response {
+    tracing::info!(
+        subdomain = %sub,
+        method = %req.method(),
+        path = %req.uri().path(),
+        "proxy"
+    );
     let Some(tunnel) = state.tunnels.get(&sub).map(|e| e.value().clone()) else {
-        return (StatusCode::BAD_GATEWAY, format!("no tunnel for {sub}")).into_response();
+        return generic_502();
     };
     let mut send_request = match tunnel.sender.lock().await.clone() {
         Some(s) => s,
-        None => return (StatusCode::BAD_GATEWAY, "tunnel client offline").into_response(),
+        None => return generic_502(),
     };
 
     let (mut parts, body) = req.into_parts();
@@ -454,7 +477,10 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
     let send_result = send_request.send_request(h2_req, false);
     let (resp_future, mut send_body) = match send_result {
         Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("h2 send: {e}")).into_response(),
+        Err(e) => {
+            tracing::debug!(error = %e, "h2 send failed");
+            return generic_502();
+        }
     };
 
     tokio::spawn(async move {
@@ -472,9 +498,10 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
     let resp = match tokio::time::timeout(HEAD_TIMEOUT, resp_future).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return (StatusCode::BAD_GATEWAY, format!("upstream: {e}")).into_response();
+            tracing::debug!(error = %e, "upstream error");
+            return generic_502();
         }
-        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "upstream timeout").into_response(),
+        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout").into_response(),
     };
 
     let (parts, mut h2_body) = resp.into_parts();
@@ -505,11 +532,8 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
     }
     let _ = builder.headers_mut();
     builder.body(body).unwrap_or_else(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("response build: {e}"),
-        )
-            .into_response()
+        tracing::debug!(error = %e, "response build");
+        generic_502()
     })
 }
 
