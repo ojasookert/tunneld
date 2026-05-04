@@ -13,6 +13,8 @@ variables:
 test:
   stage: test
   image: rust:1.95-bookworm
+  before_script:
+    - rustup component add rustfmt clippy
   script:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings

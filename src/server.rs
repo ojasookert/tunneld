@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
     body::Body,
-    extract::{Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade}},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
+    Json, Router,
 };
 use bytes::Bytes;
 use clap::Args as ClapArgs;
@@ -16,18 +19,18 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
         atomic::{AtomicU32, Ordering},
+        Arc,
     },
     time::Duration,
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{mpsc, Mutex},
 };
 use uuid::Uuid;
 
-use crate::proto::{Frame, FrameType, MAX_BODY_CHUNK, ReqHead, RespHead};
+use crate::proto::{Frame, FrameType, ReqHead, RespHead, MAX_BODY_CHUNK};
 
 const FRAME_QUEUE: usize = 256;
 const RESP_QUEUE: usize = 64;
@@ -41,7 +44,11 @@ pub struct Args {
     pub secret: String,
     #[arg(long, env = "TUNNELD_DOMAIN", default_value = "tunnel.le.ht")]
     pub domain: String,
-    #[arg(long, env = "TUNNELD_PUBLIC_BASE", default_value = "https://tunnel.le.ht")]
+    #[arg(
+        long,
+        env = "TUNNELD_PUBLIC_BASE",
+        default_value = "https://tunnel.le.ht"
+    )]
     pub public_base: String,
     #[arg(long, env = "TUNNELD_DIST_DIR", default_value = "/dist")]
     pub dist_dir: String,
@@ -134,7 +141,9 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn health() -> &'static str { "ok" }
+async fn health() -> &'static str {
+    "ok"
+}
 
 async fn install_script(State(state): State<Arc<AppState>>) -> Response {
     let body = INSTALL_SCRIPT.replace("__BASE__", state.public_base.trim_end_matches('/'));
@@ -148,10 +157,7 @@ async fn install_script(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn host_fallback(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-) -> Response {
+async fn host_fallback(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let host_hdr = req
         .headers()
         .get(header::HOST)
@@ -165,7 +171,11 @@ async fn host_fallback(
     }
     if let Some(sub) = host.strip_suffix(&format!(".{domain}")) {
         if sub.is_empty() || sub.contains('.') {
-            return (StatusCode::NOT_FOUND, "nested or empty subdomain unsupported").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                "nested or empty subdomain unsupported",
+            )
+                .into_response();
         }
         return proxy_request(state, sub.to_string(), req).await;
     }
@@ -173,7 +183,10 @@ async fn host_fallback(
 }
 
 fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
-    let Some(v) = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) else {
+    let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    else {
         return false;
     };
     v.strip_prefix("Bearer ")
@@ -182,7 +195,9 @@ fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
@@ -243,42 +258,41 @@ async fn create_tunnel(
     state.tunnels.insert(subdomain.clone(), handle);
     state.by_id.insert(tunnel_id, subdomain.clone());
 
-    let scheme = state.public_base.split("://").next().unwrap_or("https");
-    let host_port = state
+    let (scheme, host_port) = state
         .public_base
-        .splitn(2, "://")
-        .nth(1)
-        .unwrap_or(&state.domain);
+        .split_once("://")
+        .unwrap_or(("https", state.domain.as_str()));
     let public_url = format!("{scheme}://{subdomain}.{domain}", domain = state.domain);
     let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
     let ws_url = format!("{ws_scheme}://{host_port}/ws/{tunnel_id}");
 
     (
         StatusCode::CREATED,
-        Json(CreateResp { tunnel_id, subdomain, public_url, ws_url }),
+        Json(CreateResp {
+            tunnel_id,
+            subdomain,
+            public_url,
+            ws_url,
+        }),
     )
         .into_response()
 }
 
 const SAFE_ALPHABET: [char; 32] = [
-    '2', '3', '4', '5', '6', '7', '8', '9',
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
-    'j', 'k', 'm', 'n', 'p', 'q', 'r', 's',
-    't', 'u', 'v', 'w', 'x', 'y', 'z', '0',
+    '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm',
+    'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0',
 ];
 
 fn is_valid_name(n: &str) -> bool {
     !n.is_empty()
         && n.len() <= 32
-        && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !n.starts_with('-')
         && !n.ends_with('-')
 }
 
-async fn list_tunnels(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_tunnels(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
@@ -386,10 +400,7 @@ async fn run_tunnel_ws(
                     }
                 };
                 let req_id = frame.request_id;
-                let drop_after = matches!(
-                    frame.typ,
-                    FrameType::RespEnd | FrameType::Cancel
-                );
+                let drop_after = matches!(frame.typ, FrameType::RespEnd | FrameType::Cancel);
                 let send_ok = if let Some(entry) = handle.pending.get(&req_id) {
                     entry.value().send(frame).await.is_ok()
                 } else {
@@ -412,11 +423,7 @@ async fn run_tunnel_ws(
     tracing::info!(subdomain = %handle.subdomain, "tunnel disconnected");
 }
 
-async fn proxy_request(
-    state: Arc<AppState>,
-    sub: String,
-    req: Request<Body>,
-) -> Response {
+async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) -> Response {
     let Some(tunnel) = state.tunnels.get(&sub).map(|e| e.value().clone()) else {
         return (StatusCode::BAD_GATEWAY, format!("no tunnel for {sub}")).into_response();
     };
@@ -520,12 +527,20 @@ async fn proxy_request(
         if is_hop_by_hop(&k) {
             continue;
         }
-        let Ok(name) = HeaderName::from_bytes(k.as_bytes()) else { continue };
-        let Ok(val) = HeaderValue::from_str(&v) else { continue };
+        let Ok(name) = HeaderName::from_bytes(k.as_bytes()) else {
+            continue;
+        };
+        let Ok(val) = HeaderValue::from_str(&v) else {
+            continue;
+        };
         builder = builder.header(name, val);
     }
     builder.body(body).unwrap_or_else(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("response build: {e}")).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("response build: {e}"),
+        )
+            .into_response()
     })
 }
 

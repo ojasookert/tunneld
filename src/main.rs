@@ -5,7 +5,11 @@ mod proto;
 mod server;
 
 #[derive(Parser)]
-#[command(name = "tunneld", version, about = "HTTP reverse tunnel with subdomain routing")]
+#[command(
+    name = "tunneld",
+    version,
+    about = "HTTP reverse tunnel with subdomain routing"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

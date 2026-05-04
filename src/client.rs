@@ -3,18 +3,15 @@ use bytes::Bytes;
 use clap::Args as ClapArgs;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::{
-    net::TcpStream,
-    sync::mpsc,
-};
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::proto::{Frame, FrameType, MAX_BODY_CHUNK, ReqHead, RespHead};
+use crate::proto::{Frame, FrameType, ReqHead, RespHead, MAX_BODY_CHUNK};
 
 const WRITE_QUEUE: usize = 256;
 const PER_REQ_QUEUE: usize = 64;
@@ -51,7 +48,9 @@ struct CreateResp {
 
 pub async fn run(args: Args) -> Result<()> {
     let create_url = format!("{}/api/tunnels", args.url.trim_end_matches('/'));
-    let body = CreateReq { name: args.name.as_deref() };
+    let body = CreateReq {
+        name: args.name.as_deref(),
+    };
     let resp = reqwest::Client::new()
         .post(&create_url)
         .bearer_auth(&args.secret)
@@ -60,7 +59,11 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context("POST /api/tunnels")?;
     if !resp.status().is_success() {
-        anyhow::bail!("create tunnel failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        anyhow::bail!(
+            "create tunnel failed: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
     let info: CreateResp = resp.json().await.context("parse create resp")?;
     tracing::info!(public_url = %info.public_url, subdomain = %info.subdomain, "tunnel registered");
@@ -68,9 +71,17 @@ pub async fn run(args: Args) -> Result<()> {
     println!("  forwarding to http://{}", args.local);
 
     let ws_url = if info.ws_url.contains('?') {
-        format!("{}&token={}", info.ws_url, urlencoding::encode_str(&args.secret))
+        format!(
+            "{}&token={}",
+            info.ws_url,
+            urlencoding::encode_str(&args.secret)
+        )
     } else {
-        format!("{}?token={}", info.ws_url, urlencoding::encode_str(&args.secret))
+        format!(
+            "{}?token={}",
+            info.ws_url,
+            urlencoding::encode_str(&args.secret)
+        )
     };
 
     let (ws, _) = connect_async(&ws_url).await.context("ws connect")?;
@@ -155,7 +166,9 @@ async fn handle_request(
     let req_id = head_frame.request_id;
     let head: ReqHead = serde_json::from_slice(&head_frame.payload).context("parse req head")?;
 
-    let stream = TcpStream::connect(local).await.context("connect upstream")?;
+    let stream = TcpStream::connect(local)
+        .await
+        .context("connect upstream")?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(async move {
@@ -168,11 +181,7 @@ async fn handle_request(
     tokio::spawn(async move {
         while let Some(f) = req_rx.recv().await {
             match f.typ {
-                FrameType::ReqBody => {
-                    if body_tx.send(Ok(f.payload)).await.is_err() {
-                        break;
-                    }
-                }
+                FrameType::ReqBody if body_tx.send(Ok(f.payload)).await.is_err() => break,
                 FrameType::ReqEnd | FrameType::Cancel => break,
                 _ => {}
             }
@@ -180,23 +189,24 @@ async fn handle_request(
     });
 
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
-    let body = http_body_util::StreamBody::new(
-        body_stream.map(|r| r.map(http_body::Frame::data)),
-    );
+    let body = http_body_util::StreamBody::new(body_stream.map(|r| r.map(http_body::Frame::data)));
     let body: BoxBody<Bytes, std::io::Error> = BodyExt::boxed(body);
 
     let uri: Uri = head.uri.parse().unwrap_or_else(|_| Uri::from_static("/"));
-    let mut builder = Request::builder()
-        .method(head.method.as_str())
-        .uri(uri);
+    let mut builder = Request::builder().method(head.method.as_str()).uri(uri);
     for (k, v) in &head.headers {
-        if k.eq_ignore_ascii_case("host") { continue; }
+        if k.eq_ignore_ascii_case("host") {
+            continue;
+        }
         builder = builder.header(k, v);
     }
     builder = builder.header("host", &head.host);
 
     let req = builder.body(body).context("build upstream request")?;
-    let resp = sender.send_request(req).await.context("send upstream request")?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .context("send upstream request")?;
 
     let (parts, mut incoming) = resp.into_parts();
     let resp_head = RespHead {
@@ -207,22 +217,24 @@ async fn handle_request(
             .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
             .collect(),
     };
-    out_tx.send(Frame::head_resp(req_id, &resp_head)?).await.ok();
+    out_tx
+        .send(Frame::head_resp(req_id, &resp_head)?)
+        .await
+        .ok();
 
     while let Some(frame) = incoming.frame().await {
         let frame = frame.context("read upstream body")?;
         if let Ok(data) = frame.into_data() {
             for chunk in data.chunks(MAX_BODY_CHUNK) {
-                let f = Frame::new(
-                    FrameType::RespBody,
-                    req_id,
-                    Bytes::copy_from_slice(chunk),
-                );
+                let f = Frame::new(FrameType::RespBody, req_id, Bytes::copy_from_slice(chunk));
                 out_tx.send(f).await.ok();
             }
         }
     }
-    out_tx.send(Frame::end(FrameType::RespEnd, req_id)).await.ok();
+    out_tx
+        .send(Frame::end(FrameType::RespEnd, req_id))
+        .await
+        .ok();
     Ok(())
 }
 

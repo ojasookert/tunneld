@@ -65,15 +65,27 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(typ: FrameType, request_id: u32, payload: impl Into<Bytes>) -> Self {
-        Self { typ, request_id, payload: payload.into() }
+        Self {
+            typ,
+            request_id,
+            payload: payload.into(),
+        }
     }
 
     pub fn head_req(request_id: u32, head: &ReqHead) -> serde_json::Result<Self> {
-        Ok(Self::new(FrameType::ReqHead, request_id, serde_json::to_vec(head)?))
+        Ok(Self::new(
+            FrameType::ReqHead,
+            request_id,
+            serde_json::to_vec(head)?,
+        ))
     }
 
     pub fn head_resp(request_id: u32, head: &RespHead) -> serde_json::Result<Self> {
-        Ok(Self::new(FrameType::RespHead, request_id, serde_json::to_vec(head)?))
+        Ok(Self::new(
+            FrameType::RespHead,
+            request_id,
+            serde_json::to_vec(head)?,
+        ))
     }
 
     pub fn end(typ: FrameType, request_id: u32) -> Self {
@@ -95,6 +107,10 @@ impl Frame {
         let typ = FrameType::try_from(bytes[0])?;
         let request_id = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
         let payload = Bytes::copy_from_slice(&bytes[5..]);
-        Ok(Self { typ, request_id, payload })
+        Ok(Self {
+            typ,
+            request_id,
+            payload,
+        })
     }
 }
