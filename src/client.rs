@@ -92,7 +92,7 @@ pub async fn run(args: Args) -> Result<()> {
     prelude.write(&mut tls).await.context("write prelude")?;
     let reply = proto::read_reply(&mut tls).await.context("read reply")?;
     if reply != AuthReply::Ok {
-        anyhow::bail!("server rejected: {}", reply.message());
+        anyhow::bail!("server rejected the connection");
     }
     tracing::info!("data plane attached");
 

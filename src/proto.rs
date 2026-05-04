@@ -6,26 +6,10 @@ pub const MAGIC: [u8; 8] = *b"TUNNELD\0";
 pub const VERSION: u8 = 1;
 pub const MAX_TOKEN_LEN: usize = 128;
 
-#[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AuthReply {
-    Ok = 0x00,
-    BadToken = 0x01,
-    NoSuchTunnel = 0x02,
-    AlreadyAttached = 0x03,
-    Generic = 0xff,
-}
-
-impl AuthReply {
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::BadToken => "bad token",
-            Self::NoSuchTunnel => "no such tunnel",
-            Self::AlreadyAttached => "tunnel already attached",
-            Self::Generic => "generic error",
-        }
-    }
+    Ok,
+    Reject,
 }
 
 pub struct Prelude {
@@ -74,7 +58,11 @@ impl Prelude {
 }
 
 pub async fn write_reply<W: AsyncWriteExt + Unpin>(w: &mut W, reply: AuthReply) -> Result<()> {
-    w.write_all(&[reply as u8]).await?;
+    let b: u8 = match reply {
+        AuthReply::Ok => 0x00,
+        AuthReply::Reject => 0xff,
+    };
+    w.write_all(&[b]).await?;
     w.flush().await?;
     Ok(())
 }
@@ -82,11 +70,9 @@ pub async fn write_reply<W: AsyncWriteExt + Unpin>(w: &mut W, reply: AuthReply) 
 pub async fn read_reply<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<AuthReply> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b).await?;
-    Ok(match b[0] {
-        0x00 => AuthReply::Ok,
-        0x01 => AuthReply::BadToken,
-        0x02 => AuthReply::NoSuchTunnel,
-        0x03 => AuthReply::AlreadyAttached,
-        _ => AuthReply::Generic,
+    Ok(if b[0] == 0x00 {
+        AuthReply::Ok
+    } else {
+        AuthReply::Reject
     })
 }

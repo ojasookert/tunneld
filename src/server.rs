@@ -12,7 +12,12 @@ use clap::Args as ClapArgs;
 use dashmap::DashMap;
 use http_body_util::BodyExt;
 use serde::Serialize;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
@@ -24,6 +29,12 @@ use crate::proto::{self, AuthReply, Prelude};
 use crate::tls;
 
 const HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+const PRELUDE_TIMEOUT: Duration = Duration::from_secs(10);
+const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
+const REAPER_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_TUNNELS: usize = 1024;
+const API_BODY_LIMIT: usize = 8 * 1024;
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
@@ -93,6 +104,7 @@ struct TunnelHandle {
     subdomain: String,
     tunnel_id: Uuid,
     sender: Mutex<Option<h2::client::SendRequest<Bytes>>>,
+    created_at: Instant,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -122,9 +134,13 @@ pub async fn run(args: Args) -> Result<()> {
     use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
     use tracing::Level;
 
-    let traced = Router::new()
+    let api = Router::new()
         .route("/api/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/api/tunnels/:id", delete(delete_tunnel))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(API_BODY_LIMIT));
+
+    let traced = Router::new()
+        .merge(api)
         .route("/install", get(install_script))
         .nest_service("/dl", serve_dist)
         .fallback(host_fallback)
@@ -137,6 +153,9 @@ pub async fn run(args: Args) -> Result<()> {
         .with_state(state.clone());
 
     let app = Router::new().route("/health", get(health)).merge(traced);
+
+    let reaper_state = state.clone();
+    tokio::spawn(async move { run_reaper(reaper_state).await });
 
     let tls_config = tls::server_config(&args.cert_path, &args.key_path)
         .context("load tls cert/key for data plane")?;
@@ -178,40 +197,43 @@ async fn handle_data_conn(
 ) -> Result<()> {
     let _ = sock.set_nodelay(true);
     tracing::info!(peer = %peer, "data conn accepted");
-    let mut tls = acceptor.accept(sock).await.context("tls accept")?;
 
-    let prelude = match Prelude::read(&mut tls).await {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = proto::write_reply(&mut tls, AuthReply::Generic).await;
+    let mut tls = tokio::time::timeout(TLS_ACCEPT_TIMEOUT, acceptor.accept(sock))
+        .await
+        .map_err(|_| anyhow::anyhow!("tls accept timeout"))?
+        .context("tls accept")?;
+
+    let prelude_res = tokio::time::timeout(PRELUDE_TIMEOUT, Prelude::read(&mut tls)).await;
+    let prelude = match prelude_res {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            let _ = proto::write_reply(&mut tls, AuthReply::Reject).await;
             return Err(e);
+        }
+        Err(_) => {
+            let _ = proto::write_reply(&mut tls, AuthReply::Reject).await;
+            anyhow::bail!("prelude read timeout from {peer}");
         }
     };
 
     if prelude.token.as_slice() != state.secret.as_bytes() {
-        proto::write_reply(&mut tls, AuthReply::BadToken).await.ok();
-        anyhow::bail!("bad token from {peer}");
+        proto::write_reply(&mut tls, AuthReply::Reject).await.ok();
+        anyhow::bail!("rejected (bad token) from {peer}");
     }
 
     let Some(handle) = state.by_id.get(&prelude.tunnel_id).and_then(|sub| {
         let sub = sub.value().clone();
         state.tunnels.get(&sub).map(|h| h.value().clone())
     }) else {
-        proto::write_reply(&mut tls, AuthReply::NoSuchTunnel)
-            .await
-            .ok();
-        anyhow::bail!("no such tunnel: {}", prelude.tunnel_id);
+        proto::write_reply(&mut tls, AuthReply::Reject).await.ok();
+        anyhow::bail!("rejected (no such tunnel) from {peer}");
     };
 
-    {
-        let slot = handle.sender.lock().await;
-        if slot.is_some() {
-            drop(slot);
-            proto::write_reply(&mut tls, AuthReply::AlreadyAttached)
-                .await
-                .ok();
-            anyhow::bail!("already attached: {}", handle.subdomain);
-        }
+    let mut slot = handle.sender.lock().await;
+    if slot.is_some() {
+        drop(slot);
+        proto::write_reply(&mut tls, AuthReply::Reject).await.ok();
+        anyhow::bail!("rejected (already attached): {}", handle.subdomain);
     }
 
     proto::write_reply(&mut tls, AuthReply::Ok).await?;
@@ -220,7 +242,8 @@ async fn handle_data_conn(
         .await
         .context("h2 client handshake")?;
 
-    *handle.sender.lock().await = Some(send_request);
+    *slot = Some(send_request);
+    drop(slot);
     tracing::info!(subdomain = %handle.subdomain, "tunnel attached");
 
     let drive = conn.await;
@@ -232,6 +255,32 @@ async fn handle_data_conn(
 
     drive.context("h2 conn drive")?;
     Ok(())
+}
+
+async fn run_reaper(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(REAPER_INTERVAL);
+    loop {
+        tick.tick().await;
+        let now = Instant::now();
+        let stale: Vec<(String, Uuid)> = state
+            .tunnels
+            .iter()
+            .filter_map(|e| {
+                let h = e.value();
+                let attached = h.sender.try_lock().map(|s| s.is_some()).unwrap_or(true);
+                if !attached && now.duration_since(h.created_at) > ATTACH_DEADLINE {
+                    Some((h.subdomain.clone(), h.tunnel_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (sub, id) in stale {
+            state.tunnels.remove(&sub);
+            state.by_id.remove(&id);
+            tracing::info!(subdomain = %sub, "reaped orphan tunnel");
+        }
+    }
 }
 
 async fn health() -> &'static str {
@@ -369,11 +418,16 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         return (StatusCode::CONFLICT, "could not allocate subdomain").into_response();
     }
 
+    if state.tunnels.len() >= MAX_TUNNELS {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many tunnels").into_response();
+    }
+
     let tunnel_id = Uuid::new_v4();
     let handle = Arc::new(TunnelHandle {
         subdomain: subdomain.clone(),
         tunnel_id,
         sender: Mutex::new(None),
+        created_at: Instant::now(),
     });
 
     state.tunnels.insert(subdomain.clone(), handle);

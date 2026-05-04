@@ -17,10 +17,12 @@ test:
   image: rust:1.95-bookworm
   before_script:
     - rustup component add rustfmt clippy
+    - cargo install --quiet --locked cargo-audit
   script:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings
     - cargo test
+    - cargo audit --deny warnings
   except:
     - tags
 
