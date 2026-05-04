@@ -137,7 +137,9 @@ pub async fn run(args: Args) -> Result<()> {
     let api = Router::new()
         .route("/api/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/api/tunnels/:id", delete(delete_tunnel))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(API_BODY_LIMIT));
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            API_BODY_LIMIT,
+        ));
 
     let traced = Router::new()
         .merge(api)
