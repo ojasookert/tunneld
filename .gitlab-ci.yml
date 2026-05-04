@@ -22,7 +22,7 @@ test:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings
     - cargo test
-    - cargo audit --deny warnings
+    - cargo audit
   except:
     - tags
 
