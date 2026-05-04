@@ -2,6 +2,7 @@ FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
         gcc-mingw-w64-x86-64 \
     && rm -rf /var/lib/apt/lists/*
 
