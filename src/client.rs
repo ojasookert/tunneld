@@ -18,8 +18,8 @@ const PER_REQ_QUEUE: usize = 64;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
-    /// Public base URL of tunneld server, e.g. https://tunnel.le.ht
-    #[arg(long, env = "TUNNELD_URL")]
+    /// Public base URL of tunneld server
+    #[arg(long, env = "TUNNELD_URL", default_value = "https://tunnel.le.ht")]
     pub url: String,
     /// Bearer token (server's TUNNELD_SECRET)
     #[arg(long, env = "TUNNELD_SECRET")]
