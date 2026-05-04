@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
-    },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -13,33 +10,27 @@ use axum::{
 use bytes::Bytes;
 use clap::Args as ClapArgs;
 use dashmap::DashMap;
-use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use serde::{Deserialize, Serialize};
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use serde::Serialize;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
-    net::TcpListener,
-    sync::{mpsc, Mutex},
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-use crate::proto::{Frame, FrameType, ReqHead, RespHead, MAX_BODY_CHUNK};
+use crate::proto::{self, AuthReply, Prelude};
+use crate::tls;
 
-const FRAME_QUEUE: usize = 256;
-const RESP_QUEUE: usize = 64;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
     #[arg(long, env = "TUNNELD_BIND", default_value = "0.0.0.0:8080")]
     pub bind: SocketAddr,
+    #[arg(long, env = "TUNNELD_DATA_BIND", default_value = "0.0.0.0:7844")]
+    pub data_bind: SocketAddr,
     #[arg(long, env = "TUNNELD_SECRET")]
     pub secret: String,
     #[arg(long, env = "TUNNELD_DOMAIN", default_value = "tunnel.le.ht")]
@@ -50,14 +41,21 @@ pub struct Args {
         default_value = "https://tunnel.le.ht"
     )]
     pub public_base: String,
+    #[arg(long, env = "TUNNELD_DATA_PUBLIC", default_value = "tunnel.le.ht:7844")]
+    pub data_public: String,
     #[arg(long, env = "TUNNELD_DIST_DIR", default_value = "/dist")]
     pub dist_dir: String,
+    #[arg(long, env = "TUNNELD_CERT_PATH", default_value = "/tls/tls.crt")]
+    pub cert_path: PathBuf,
+    #[arg(long, env = "TUNNELD_KEY_PATH", default_value = "/tls/tls.key")]
+    pub key_path: PathBuf,
 }
 
 pub struct AppState {
     secret: String,
     domain: String,
     public_base: String,
+    data_public: String,
     tunnels: DashMap<String, Arc<TunnelHandle>>,
     by_id: DashMap<Uuid, String>,
 }
@@ -94,28 +92,25 @@ mv "${DEST}.tmp" "${DEST}"
 struct TunnelHandle {
     subdomain: String,
     tunnel_id: Uuid,
-    frame_tx: Mutex<Option<mpsc::Sender<Frame>>>,
-    next_request_id: AtomicU32,
-    pending: DashMap<u32, mpsc::Sender<Frame>>,
-}
-
-impl TunnelHandle {
-    fn next_request_id(&self) -> u32 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
-    }
+    sender: Mutex<Option<h2::client::SendRequest<Bytes>>>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
     if args.secret.len() < 16 {
         anyhow::bail!("TUNNELD_SECRET must be at least 16 chars");
     }
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
     let bind = args.bind;
+    let data_bind = args.data_bind;
     let dist_dir = args.dist_dir.clone();
     let state = Arc::new(AppState {
         secret: args.secret,
         domain: args.domain,
         public_base: args.public_base,
+        data_public: args.data_public,
         tunnels: DashMap::new(),
         by_id: DashMap::new(),
     });
@@ -127,7 +122,6 @@ pub async fn run(args: Args) -> Result<()> {
     let app = Router::new()
         .route("/api/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/api/tunnels/:id", delete(delete_tunnel))
-        .route("/ws/:id", get(ws_upgrade))
         .route("/health", get(health))
         .route("/install", get(install_script))
         .nest_service("/dl", serve_dist)
@@ -135,9 +129,98 @@ pub async fn run(args: Args) -> Result<()> {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    let tls_config = tls::server_config(&args.cert_path, &args.key_path)
+        .context("load tls cert/key for data plane")?;
+    let acceptor = TlsAcceptor::from(tls_config);
+
+    let data_listener = TcpListener::bind(data_bind).await.context("bind data")?;
+    tracing::info!(addr = %data_listener.local_addr()?, "tunneld data plane listening");
+    let data_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = match data_listener.accept().await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "data accept");
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let state = data_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_data_conn(sock, peer, acceptor, state).await {
+                    tracing::debug!(peer = %peer, error = %e, "data conn closed");
+                }
+            });
+        }
+    });
+
     let listener = TcpListener::bind(bind).await.context("bind")?;
-    tracing::info!(bind = %listener.local_addr()?, domain = %state.domain, "tunneld listening");
+    tracing::info!(bind = %listener.local_addr()?, domain = %state.domain, "tunneld control plane listening");
     axum::serve(listener, app).await.context("axum serve")?;
+    Ok(())
+}
+
+async fn handle_data_conn(
+    sock: TcpStream,
+    peer: SocketAddr,
+    acceptor: TlsAcceptor,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let _ = sock.set_nodelay(true);
+    let mut tls = acceptor.accept(sock).await.context("tls accept")?;
+
+    let prelude = match Prelude::read(&mut tls).await {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = proto::write_reply(&mut tls, AuthReply::Generic).await;
+            return Err(e);
+        }
+    };
+
+    if prelude.token.as_slice() != state.secret.as_bytes() {
+        proto::write_reply(&mut tls, AuthReply::BadToken).await.ok();
+        anyhow::bail!("bad token from {peer}");
+    }
+
+    let Some(handle) = state.by_id.get(&prelude.tunnel_id).and_then(|sub| {
+        let sub = sub.value().clone();
+        state.tunnels.get(&sub).map(|h| h.value().clone())
+    }) else {
+        proto::write_reply(&mut tls, AuthReply::NoSuchTunnel)
+            .await
+            .ok();
+        anyhow::bail!("no such tunnel: {}", prelude.tunnel_id);
+    };
+
+    {
+        let slot = handle.sender.lock().await;
+        if slot.is_some() {
+            drop(slot);
+            proto::write_reply(&mut tls, AuthReply::AlreadyAttached)
+                .await
+                .ok();
+            anyhow::bail!("already attached: {}", handle.subdomain);
+        }
+    }
+
+    proto::write_reply(&mut tls, AuthReply::Ok).await?;
+
+    let (send_request, conn) = h2::client::handshake(tls)
+        .await
+        .context("h2 client handshake")?;
+
+    *handle.sender.lock().await = Some(send_request);
+    tracing::info!(subdomain = %handle.subdomain, "tunnel attached");
+
+    let drive = conn.await;
+
+    *handle.sender.lock().await = None;
+    state.tunnels.remove(&handle.subdomain);
+    state.by_id.remove(&handle.tunnel_id);
+    tracing::info!(subdomain = %handle.subdomain, "tunnel detached");
+
+    drive.context("h2 conn drive")?;
     Ok(())
 }
 
@@ -242,7 +325,7 @@ struct CreateResp {
     tunnel_id: Uuid,
     subdomain: String,
     public_url: String,
-    ws_url: String,
+    connect_addr: String,
 }
 
 #[derive(Serialize)]
@@ -272,21 +355,18 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     let handle = Arc::new(TunnelHandle {
         subdomain: subdomain.clone(),
         tunnel_id,
-        frame_tx: Mutex::new(None),
-        next_request_id: AtomicU32::new(1),
-        pending: DashMap::new(),
+        sender: Mutex::new(None),
     });
 
     state.tunnels.insert(subdomain.clone(), handle);
     state.by_id.insert(tunnel_id, subdomain.clone());
 
-    let (scheme, host_port) = state
+    let scheme = state
         .public_base
         .split_once("://")
-        .unwrap_or(("https", state.domain.as_str()));
-    let public_url = format!("{scheme}://{subdomain}.{domain}", domain = state.domain);
-    let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
-    let ws_url = format!("{ws_scheme}://{host_port}/ws/{tunnel_id}");
+        .map(|s| s.0)
+        .unwrap_or("https");
+    let public_url = format!("{scheme}://{subdomain}.{}", state.domain);
 
     (
         StatusCode::CREATED,
@@ -294,7 +374,7 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, headers: HeaderMap) -
             tunnel_id,
             subdomain,
             public_url,
-            ws_url,
+            connect_addr: state.data_public.clone(),
         }),
     )
         .into_response()
@@ -331,222 +411,99 @@ async fn delete_tunnel(
     }
     if let Some((_, sub)) = state.by_id.remove(&id) {
         if let Some((_, handle)) = state.tunnels.remove(&sub) {
-            *handle.frame_tx.lock().await = None;
-            handle.pending.clear();
+            *handle.sender.lock().await = None;
         }
         return StatusCode::NO_CONTENT.into_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-#[derive(Deserialize)]
-struct WsAuth {
-    token: Option<String>,
-}
-
-async fn ws_upgrade(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-    Query(q): Query<WsAuth>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    let token_ok = check_auth(&headers, &state.secret)
-        || q.token
-            .as_deref()
-            .map(|t| constant_time_eq(t.as_bytes(), state.secret.as_bytes()))
-            .unwrap_or(false);
-    if !token_ok {
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
-    }
-
-    let Some(sub) = state.by_id.get(&id).map(|e| e.value().clone()) else {
-        return (StatusCode::NOT_FOUND, "no such tunnel").into_response();
-    };
-    let Some(handle) = state.tunnels.get(&sub).map(|e| e.value().clone()) else {
-        return (StatusCode::NOT_FOUND, "no such tunnel").into_response();
-    };
-
-    {
-        let mut slot = handle.frame_tx.lock().await;
-        if slot.is_some() {
-            return (StatusCode::CONFLICT, "already attached").into_response();
-        }
-        let (tx, rx) = mpsc::channel::<Frame>(FRAME_QUEUE);
-        *slot = Some(tx);
-        let st = state.clone();
-        let h = handle.clone();
-        upgrade.on_upgrade(move |ws| async move { run_tunnel_ws(ws, h, st, rx).await })
-    }
-}
-
-async fn run_tunnel_ws(
-    ws: WebSocket,
-    handle: Arc<TunnelHandle>,
-    state: Arc<AppState>,
-    mut frame_rx: mpsc::Receiver<Frame>,
-) {
-    let (mut sink, mut stream) = ws.split();
-
-    let writer = tokio::spawn(async move {
-        while let Some(f) = frame_rx.recv().await {
-            let bytes = f.encode();
-            if sink.send(Message::Binary(bytes.to_vec())).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-
-    tracing::info!(subdomain = %handle.subdomain, "tunnel attached");
-
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { break };
-        match msg {
-            Message::Binary(bytes) => {
-                let frame = match Frame::decode(&bytes) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad frame");
-                        continue;
-                    }
-                };
-                let req_id = frame.request_id;
-                let drop_after = matches!(frame.typ, FrameType::RespEnd | FrameType::Cancel);
-                let send_ok = if let Some(entry) = handle.pending.get(&req_id) {
-                    entry.value().send(frame).await.is_ok()
-                } else {
-                    false
-                };
-                if !send_ok || drop_after {
-                    handle.pending.remove(&req_id);
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    *handle.frame_tx.lock().await = None;
-    handle.pending.clear();
-    state.tunnels.remove(&handle.subdomain);
-    state.by_id.remove(&handle.tunnel_id);
-    let _ = writer.await;
-    tracing::info!(subdomain = %handle.subdomain, "tunnel disconnected");
-}
-
 async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) -> Response {
     let Some(tunnel) = state.tunnels.get(&sub).map(|e| e.value().clone()) else {
         return (StatusCode::BAD_GATEWAY, format!("no tunnel for {sub}")).into_response();
     };
-    let frame_tx = match tunnel.frame_tx.lock().await.clone() {
-        Some(tx) => tx,
+    let mut send_request = match tunnel.sender.lock().await.clone() {
+        Some(s) => s,
         None => return (StatusCode::BAD_GATEWAY, "tunnel client offline").into_response(),
     };
 
-    let request_id = tunnel.next_request_id();
-    let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(RESP_QUEUE);
-    tunnel.pending.insert(request_id, resp_tx);
+    let (mut parts, body) = req.into_parts();
 
-    let (parts, body) = req.into_parts();
-    let host_full = parts
-        .headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    parts.headers.remove(header::CONNECTION);
+    parts.headers.remove("keep-alive");
+    parts.headers.remove(header::PROXY_AUTHENTICATE);
+    parts.headers.remove(header::PROXY_AUTHORIZATION);
+    parts.headers.remove(header::TE);
+    parts.headers.remove(header::TRAILER);
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    parts.headers.remove(header::UPGRADE);
+    parts.headers.remove(header::HOST);
 
-    let head = ReqHead {
-        method: parts.method.to_string(),
-        uri: parts
-            .uri
-            .path_and_query()
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "/".into()),
-        host: host_full,
-        headers: parts
-            .headers
-            .iter()
-            .filter(|(k, _)| !is_hop_by_hop(k.as_str()))
-            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-            .collect(),
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/".into());
+    let abs_uri: Uri = format!("https://{sub}.{}{path_and_query}", state.domain)
+        .parse()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+    parts.uri = abs_uri;
+    parts.version = http::Version::HTTP_2;
+    let h2_req = http::Request::from_parts(parts, ());
+
+    let send_result = send_request.send_request(h2_req, false);
+    let (resp_future, mut send_body) = match send_result {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("h2 send: {e}")).into_response(),
     };
 
-    let head_frame = match Frame::head_req(request_id, &head) {
-        Ok(f) => f,
-        Err(_) => {
-            tunnel.pending.remove(&request_id);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "head encode").into_response();
-        }
-    };
-
-    if frame_tx.send(head_frame).await.is_err() {
-        tunnel.pending.remove(&request_id);
-        return (StatusCode::BAD_GATEWAY, "tunnel closed").into_response();
-    }
-
-    let body_tx = frame_tx.clone();
     tokio::spawn(async move {
         let mut body = body;
-        loop {
-            match body.frame().await {
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        for chunk in data.chunks(MAX_BODY_CHUNK) {
-                            let f = Frame::new(
-                                FrameType::ReqBody,
-                                request_id,
-                                Bytes::copy_from_slice(chunk),
-                            );
-                            if body_tx.send(f).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data() {
+                if !data.is_empty() && send_body.send_data(data, false).is_err() {
+                    return;
                 }
-                Some(Err(_)) => break,
-                None => break,
             }
         }
-        let _ = body_tx
-            .send(Frame::end(FrameType::ReqEnd, request_id))
-            .await;
+        let _ = send_body.send_data(Bytes::new(), true);
     });
 
-    let head_frame = match tokio::time::timeout(HEAD_TIMEOUT, resp_rx.recv()).await {
-        Ok(Some(f)) if f.typ == FrameType::RespHead => f,
-        _ => {
-            tunnel.pending.remove(&request_id);
-            return (StatusCode::BAD_GATEWAY, "no response").into_response();
+    let resp = match tokio::time::timeout(HEAD_TIMEOUT, resp_future).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, format!("upstream: {e}")).into_response();
         }
+        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "upstream timeout").into_response(),
     };
 
-    let resp_head: RespHead = match serde_json::from_slice(&head_frame.payload) {
-        Ok(h) => h,
-        Err(_) => {
-            tunnel.pending.remove(&request_id);
-            return (StatusCode::BAD_GATEWAY, "bad response head").into_response();
+    let (parts, mut h2_body) = resp.into_parts();
+
+    let body_stream = async_stream::stream! {
+        while let Some(chunk) = h2_body.data().await {
+            match chunk {
+                Ok(data) => {
+                    let _ = h2_body.flow_control().release_capacity(data.len());
+                    yield Ok::<_, std::io::Error>(data);
+                }
+                Err(_) => break,
+            }
         }
     };
-
-    let pending = tunnel.pending.clone();
-    let body_stream = build_body_stream(resp_rx, request_id, pending);
     let body = Body::from_stream(body_stream);
 
-    let mut builder = Response::builder()
-        .status(StatusCode::from_u16(resp_head.status).unwrap_or(StatusCode::BAD_GATEWAY));
-    for (k, v) in resp_head.headers {
-        if is_hop_by_hop(&k) {
+    let mut builder = Response::builder().status(parts.status);
+    for (k, v) in &parts.headers {
+        if is_hop_by_hop(k.as_str()) {
             continue;
         }
-        let Ok(name) = HeaderName::from_bytes(k.as_bytes()) else {
-            continue;
-        };
-        let Ok(val) = HeaderValue::from_str(&v) else {
-            continue;
-        };
-        builder = builder.header(name, val);
+        builder = builder.header(
+            HeaderName::from_bytes(k.as_str().as_bytes())
+                .unwrap_or_else(|_| HeaderName::from_static("x-tunneld-bad-header")),
+            v.clone(),
+        );
     }
+    let _ = builder.headers_mut();
     builder.body(body).unwrap_or_else(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -554,25 +511,6 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
         )
             .into_response()
     })
-}
-
-fn build_body_stream(
-    mut resp_rx: mpsc::Receiver<Frame>,
-    request_id: u32,
-    pending: DashMap<u32, mpsc::Sender<Frame>>,
-) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
-    async_stream::stream! {
-        loop {
-            match resp_rx.recv().await {
-                Some(f) if f.typ == FrameType::RespBody => yield Ok(f.payload),
-                Some(f) if f.typ == FrameType::RespEnd => break,
-                Some(f) if f.typ == FrameType::Cancel => break,
-                Some(_) => {}
-                None => break,
-            }
-        }
-        pending.remove(&request_id);
-    }
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -587,6 +525,9 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "host"
-            | "content-length"
     )
 }
+
+// keep an unused HeaderValue path so unused-import lint doesn't fire
+#[allow(dead_code)]
+fn _unused(_: HeaderValue) {}

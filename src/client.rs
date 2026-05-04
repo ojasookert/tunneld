@@ -1,20 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Args as ClapArgs;
-use dashmap::DashMap;
-use futures_util::{SinkExt, StreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::ServerName;
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::{net::TcpStream, sync::mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use uuid::Uuid;
 
-use crate::proto::{Frame, FrameType, ReqHead, RespHead, MAX_BODY_CHUNK};
-
-const WRITE_QUEUE: usize = 256;
-const PER_REQ_QUEUE: usize = 64;
+use crate::proto::{self, AuthReply, Prelude};
+use crate::tls;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -27,18 +25,27 @@ pub struct Args {
     /// Local upstream address, e.g. 127.0.0.1:3000
     #[arg(long)]
     pub local: String,
+    /// Override data-plane addr (else use server-provided connect_addr)
+    #[arg(long, env = "TUNNELD_CONNECT_ADDR")]
+    pub connect_addr: Option<String>,
+    /// Skip TLS cert verification (testing only)
+    #[arg(long, env = "TUNNELD_INSECURE")]
+    pub insecure: bool,
 }
 
 #[derive(Deserialize, Debug)]
 struct CreateResp {
-    #[allow(dead_code)]
-    tunnel_id: String,
+    tunnel_id: Uuid,
     subdomain: String,
     public_url: String,
-    ws_url: String,
+    connect_addr: String,
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let create_url = format!("{}/api/tunnels", args.url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .post(&create_url)
@@ -58,185 +65,169 @@ pub async fn run(args: Args) -> Result<()> {
     println!("→ {}", info.public_url);
     println!("  forwarding to http://{}", args.local);
 
-    let ws_url = if info.ws_url.contains('?') {
-        format!(
-            "{}&token={}",
-            info.ws_url,
-            urlencoding::encode_str(&args.secret)
-        )
-    } else {
-        format!(
-            "{}?token={}",
-            info.ws_url,
-            urlencoding::encode_str(&args.secret)
-        )
+    let connect_addr = args.connect_addr.unwrap_or(info.connect_addr);
+    let (sni_host, _) = connect_addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("connect_addr missing port: {connect_addr}"))?;
+
+    let tls_config = tls::client_config(args.insecure).context("build client tls config")?;
+    let connector = TlsConnector::from(tls_config);
+
+    tracing::info!(addr = %connect_addr, "dialing data plane");
+    let tcp = TcpStream::connect(&connect_addr)
+        .await
+        .context("data tcp connect")?;
+    let _ = tcp.set_nodelay(true);
+    let server_name = ServerName::try_from(sni_host.to_string())
+        .map_err(|_| anyhow!("bad SNI host: {sni_host}"))?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("tls handshake")?;
+
+    let prelude = Prelude {
+        tunnel_id: info.tunnel_id,
+        token: args.secret.as_bytes().to_vec(),
     };
+    prelude.write(&mut tls).await.context("write prelude")?;
+    let reply = proto::read_reply(&mut tls).await.context("read reply")?;
+    if reply != AuthReply::Ok {
+        anyhow::bail!("server rejected: {}", reply.message());
+    }
+    tracing::info!("data plane attached");
 
-    let (ws, _) = connect_async(&ws_url).await.context("ws connect")?;
-    tracing::info!("ws connected");
-    let (mut sink, mut stream) = ws.split();
+    let mut h2_conn = h2::server::handshake(tls)
+        .await
+        .context("h2 server handshake")?;
 
-    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(WRITE_QUEUE);
-    let writer = tokio::spawn(async move {
-        while let Some(f) = out_rx.recv().await {
-            if sink
-                .send(Message::Binary(f.encode().to_vec()))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-
-    let pending: Arc<DashMap<u32, mpsc::Sender<Frame>>> = Arc::new(DashMap::new());
     let local = Arc::new(args.local);
-
-    while let Some(msg) = stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
+    while let Some(stream_result) = h2_conn.accept().await {
+        let (req, respond) = match stream_result {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!(error = %e, "ws read");
+                tracing::warn!(error = %e, "h2 accept");
                 break;
             }
         };
-        match msg {
-            Message::Binary(bytes) => {
-                let frame = match Frame::decode(&bytes) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad frame");
-                        continue;
-                    }
-                };
-                match frame.typ {
-                    FrameType::ReqHead => {
-                        let req_id = frame.request_id;
-                        let (req_tx, req_rx) = mpsc::channel::<Frame>(PER_REQ_QUEUE);
-                        pending.insert(req_id, req_tx);
-                        let out = out_tx.clone();
-                        let local = local.clone();
-                        let pending2 = pending.clone();
-                        tokio::spawn(async move {
-                            let res = handle_request(frame, req_rx, out.clone(), &local).await;
-                            if let Err(e) = res {
-                                tracing::warn!(req_id, error = %e, "request failed");
-                                let _ = out.send(Frame::end(FrameType::Cancel, req_id)).await;
-                            }
-                            pending2.remove(&req_id);
-                        });
-                    }
-                    FrameType::ReqBody | FrameType::ReqEnd | FrameType::Cancel => {
-                        if let Some(entry) = pending.get(&frame.request_id) {
-                            let _ = entry.value().send(frame).await;
-                        }
-                    }
-                    _ => {}
-                }
+        let local = local.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_request(req, respond, &local).await {
+                tracing::warn!(error = %e, "request failed");
             }
-            Message::Close(_) => break,
-            _ => {}
-        }
+        });
     }
 
-    drop(out_tx);
-    let _ = writer.await;
     Ok(())
 }
 
 async fn handle_request(
-    head_frame: Frame,
-    mut req_rx: mpsc::Receiver<Frame>,
-    out_tx: mpsc::Sender<Frame>,
+    h2_req: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
     local: &str,
 ) -> Result<()> {
-    let req_id = head_frame.request_id;
-    let head: ReqHead = serde_json::from_slice(&head_frame.payload).context("parse req head")?;
-
     let stream = TcpStream::connect(local)
         .await
         .context("connect upstream")?;
+    let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("http1 handshake")?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::debug!(error = %e, "upstream conn closed");
         }
     });
 
-    let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(PER_REQ_QUEUE);
+    let (parts, mut h2_body) = h2_req.into_parts();
+
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/".into());
+    let local_uri: Uri = path_and_query
+        .parse()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
-        while let Some(f) = req_rx.recv().await {
-            match f.typ {
-                FrameType::ReqBody if body_tx.send(Ok(f.payload)).await.is_err() => break,
-                FrameType::ReqEnd | FrameType::Cancel => break,
-                _ => {}
+        while let Some(chunk) = h2_body.data().await {
+            match chunk {
+                Ok(data) => {
+                    let _ = h2_body.flow_control().release_capacity(data.len());
+                    if !data.is_empty() && body_tx.send(Ok(data)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
             }
         }
     });
-
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
     let body = http_body_util::StreamBody::new(body_stream.map(|r| r.map(http_body::Frame::data)));
     let body: BoxBody<Bytes, std::io::Error> = BodyExt::boxed(body);
 
-    let uri: Uri = head.uri.parse().unwrap_or_else(|_| Uri::from_static("/"));
-    let mut builder = Request::builder().method(head.method.as_str()).uri(uri);
-    for (k, v) in &head.headers {
-        if k.eq_ignore_ascii_case("host") {
+    let mut builder = Request::builder()
+        .method(parts.method.clone())
+        .uri(local_uri);
+    for (k, v) in &parts.headers {
+        if k.as_str().eq_ignore_ascii_case("host")
+            || k.as_str().eq_ignore_ascii_case("content-length")
+            || k.as_str().starts_with(':')
+        {
             continue;
         }
-        builder = builder.header(k, v);
+        builder = builder.header(k.as_str(), v.clone());
     }
-    builder = builder.header("host", &head.host);
+    if let Some(h) = parts.uri.authority().map(|a| a.as_str().to_string()) {
+        builder = builder.header("host", h);
+    }
 
-    let req = builder.body(body).context("build upstream request")?;
-    let resp = sender
-        .send_request(req)
+    let upstream_req = builder.body(body).context("build upstream request")?;
+    let upstream_resp = sender
+        .send_request(upstream_req)
         .await
-        .context("send upstream request")?;
+        .context("send upstream")?;
 
-    let (parts, mut incoming) = resp.into_parts();
-    let resp_head = RespHead {
-        status: parts.status.as_u16(),
-        headers: parts
-            .headers
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-            .collect(),
-    };
-    out_tx
-        .send(Frame::head_resp(req_id, &resp_head)?)
-        .await
-        .ok();
+    let (uparts, mut uincoming) = upstream_resp.into_parts();
 
-    while let Some(frame) = incoming.frame().await {
+    let mut h2_resp_builder = http::Response::builder().status(uparts.status);
+    for (k, v) in &uparts.headers {
+        let lower = k.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        h2_resp_builder = h2_resp_builder.header(k.as_str(), v.clone());
+    }
+    let h2_resp = h2_resp_builder.body(()).context("build h2 response")?;
+
+    let mut send_body = respond
+        .send_response(h2_resp, false)
+        .context("send_response")?;
+
+    while let Some(frame) = uincoming.frame().await {
         let frame = frame.context("read upstream body")?;
         if let Ok(data) = frame.into_data() {
-            for chunk in data.chunks(MAX_BODY_CHUNK) {
-                let f = Frame::new(FrameType::RespBody, req_id, Bytes::copy_from_slice(chunk));
-                out_tx.send(f).await.ok();
+            if !data.is_empty() {
+                send_body.send_data(data, false).context("send_data")?;
             }
         }
     }
-    out_tx
-        .send(Frame::end(FrameType::RespEnd, req_id))
-        .await
-        .ok();
+    send_body
+        .send_data(Bytes::new(), true)
+        .context("send_data end")?;
     Ok(())
 }
 
-mod urlencoding {
-    pub fn encode_str(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
-                }
-                _ => out.push_str(&format!("%{b:02X}")),
-            }
-        }
-        out
-    }
-}
+use futures_util::StreamExt;

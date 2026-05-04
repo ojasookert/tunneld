@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod client;
 mod proto;
 mod server;
+mod tls;
 
 #[derive(Parser)]
 #[command(
