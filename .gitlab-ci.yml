@@ -27,10 +27,10 @@ test:
 build:
   stage: build
   before_script:
+    - until docker info; do sleep 1; done
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
-    - docker build -t $COMMIT_IMAGE .
-    - docker tag $COMMIT_IMAGE $CI_REGISTRY_IMAGE:latest
+    - docker build -t $COMMIT_IMAGE -t $CI_REGISTRY_IMAGE:latest .
     - docker push --all-tags $CI_REGISTRY_IMAGE
   except:
     - tags
@@ -38,6 +38,7 @@ build:
 release:
   stage: release
   before_script:
+    - until docker info; do sleep 1; done
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
     - docker pull $COMMIT_IMAGE
