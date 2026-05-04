@@ -1,4 +1,4 @@
-FROM rust:1.95-alpine3.20 AS prod-builder
+FROM rust:1.95-alpine AS prod-builder
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
