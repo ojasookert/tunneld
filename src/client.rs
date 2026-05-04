@@ -220,12 +220,14 @@ async fn handle_request(
         let frame = frame.context("read upstream body")?;
         if let Ok(data) = frame.into_data() {
             if !data.is_empty() {
-                send_body.send_data(data, false).context("send_data")?;
+                proto::send_h2_with_backpressure(&mut send_body, data, false)
+                    .await
+                    .context("send_data")?;
             }
         }
     }
-    send_body
-        .send_data(Bytes::new(), true)
+    proto::send_h2_with_backpressure(&mut send_body, Bytes::new(), true)
+        .await
         .context("send_data end")?;
     Ok(())
 }

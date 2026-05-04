@@ -1,6 +1,36 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+
+/// Send `data` over an h2 SendStream while respecting the remote flow-control
+/// window. Without this, send_data queues into h2's local buffer regardless of
+/// downstream consumer speed, letting the upstream HTTP body flood RAM.
+pub async fn send_h2_with_backpressure(
+    send: &mut h2::SendStream<Bytes>,
+    mut data: Bytes,
+    end: bool,
+) -> Result<()> {
+    if data.is_empty() {
+        send.send_data(data, end)?;
+        return Ok(());
+    }
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let cap = std::future::poll_fn(|cx| send.poll_capacity(cx)).await;
+        let cap = match cap {
+            Some(Ok(c)) if c > 0 => c,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(e.into()),
+            None => return Ok(()),
+        };
+        let take = cap.min(data.len());
+        let chunk = data.split_to(take);
+        let is_last = data.is_empty() && end;
+        send.send_data(chunk, is_last)?;
+    }
+    Ok(())
+}
 
 pub const MAGIC: [u8; 8] = *b"TUNNELD\0";
 pub const VERSION: u8 = 1;

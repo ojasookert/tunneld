@@ -544,12 +544,16 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
         let mut body = body;
         while let Some(Ok(frame)) = body.frame().await {
             if let Ok(data) = frame.into_data() {
-                if !data.is_empty() && send_body.send_data(data, false).is_err() {
+                if !data.is_empty()
+                    && proto::send_h2_with_backpressure(&mut send_body, data, false)
+                        .await
+                        .is_err()
+                {
                     return;
                 }
             }
         }
-        let _ = send_body.send_data(Bytes::new(), true);
+        let _ = proto::send_h2_with_backpressure(&mut send_body, Bytes::new(), true).await;
     });
 
     let resp = match tokio::time::timeout(HEAD_TIMEOUT, resp_future).await {
@@ -567,8 +571,9 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
         while let Some(chunk) = h2_body.data().await {
             match chunk {
                 Ok(data) => {
-                    let _ = h2_body.flow_control().release_capacity(data.len());
+                    let len = data.len();
                     yield Ok::<_, std::io::Error>(data);
+                    let _ = h2_body.flow_control().release_capacity(len);
                 }
                 Err(_) => break,
             }
