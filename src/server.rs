@@ -122,10 +122,9 @@ pub async fn run(args: Args) -> Result<()> {
     use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
     use tracing::Level;
 
-    let app = Router::new()
+    let traced = Router::new()
         .route("/api/tunnels", post(create_tunnel).get(list_tunnels))
         .route("/api/tunnels/:id", delete(delete_tunnel))
-        .route("/health", get(health))
         .route("/install", get(install_script))
         .nest_service("/dl", serve_dist)
         .fallback(host_fallback)
@@ -136,6 +135,8 @@ pub async fn run(args: Args) -> Result<()> {
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .with_state(state.clone());
+
+    let app = Router::new().route("/health", get(health)).merge(traced);
 
     let tls_config = tls::server_config(&args.cert_path, &args.key_path)
         .context("load tls cert/key for data plane")?;
