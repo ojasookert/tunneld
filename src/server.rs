@@ -7,11 +7,14 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine;
 use bytes::Bytes;
 use clap::Args as ClapArgs;
 use dashmap::DashMap;
 use http_body_util::BodyExt;
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
+use sha1::{Digest, Sha1};
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -19,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -27,6 +31,9 @@ use uuid::Uuid;
 
 use crate::proto::{self, AuthReply, Prelude};
 use crate::tls;
+
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_PIPE_BUF: usize = 16 * 1024;
 
 const HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -507,6 +514,10 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
         None => return generic_502(),
     };
 
+    if is_ws_upgrade(&req) {
+        return proxy_ws(state, sub, req, send_request).await;
+    }
+
     let (mut parts, body) = req.into_parts();
 
     parts.headers.remove(header::CONNECTION);
@@ -597,6 +608,210 @@ async fn proxy_request(state: Arc<AppState>, sub: String, req: Request<Body>) ->
         tracing::debug!(error = %e, "response build");
         generic_502()
     })
+}
+
+fn is_ws_upgrade(req: &Request<Body>) -> bool {
+    if req.method() != http::Method::GET {
+        return false;
+    }
+    let upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !upgrade.eq_ignore_ascii_case("websocket") {
+        return false;
+    }
+    // Connection header is a comma-separated list; the spec requires it to
+    // contain "Upgrade" (case-insensitive).
+    let conn = req
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    conn.split(',')
+        .any(|p| p.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+fn ws_accept(key: &str) -> String {
+    let mut h = Sha1::new();
+    h.update(key.as_bytes());
+    h.update(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
+}
+
+/// Handle a browser WebSocket Upgrade: translate it to an h2 Extended CONNECT
+/// stream on the data plane, return 101 to the browser, and bidirectionally
+/// pipe bytes between the upgraded browser socket and the h2 stream.
+async fn proxy_ws(
+    state: Arc<AppState>,
+    sub: String,
+    mut req: Request<Body>,
+    mut send_request: h2::client::SendRequest<Bytes>,
+) -> Response {
+    // Validate browser handshake.
+    let Some(key_hdr) = req.headers().get(header::SEC_WEBSOCKET_KEY) else {
+        return (StatusCode::BAD_REQUEST, "missing sec-websocket-key").into_response();
+    };
+    let Ok(key_str) = key_hdr.to_str() else {
+        return (StatusCode::BAD_REQUEST, "bad sec-websocket-key").into_response();
+    };
+    let accept = ws_accept(key_str);
+
+    // Build the h2 CONNECT request: same path/query as the browser, :authority
+    // set to <sub>.<domain>, and :protocol = websocket via the h2 extension.
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/".into());
+    let abs_uri: Uri = match format!("https://{sub}.{}{path_and_query}", state.domain).parse() {
+        Ok(u) => u,
+        Err(_) => return generic_502(),
+    };
+
+    let mut h2_req_builder = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(abs_uri)
+        .version(http::Version::HTTP_2);
+    for (k, v) in req.headers() {
+        let lower = k.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "host"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "content-length"
+                | "transfer-encoding"
+                | "te"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "trailers"
+        ) {
+            continue;
+        }
+        h2_req_builder = h2_req_builder.header(k.as_str(), v.clone());
+    }
+    let mut h2_req = match h2_req_builder.body(()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "build h2 CONNECT");
+            return generic_502();
+        }
+    };
+    h2_req
+        .extensions_mut()
+        .insert(h2::ext::Protocol::from_static("websocket"));
+
+    let send_result = send_request.send_request(h2_req, false);
+    let (resp_future, send_body) = match send_result {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "h2 send CONNECT failed");
+            return generic_502();
+        }
+    };
+
+    let resp = match tokio::time::timeout(HEAD_TIMEOUT, resp_future).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "ws upstream error");
+            return generic_502();
+        }
+        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout").into_response(),
+    };
+
+    if resp.status() != http::StatusCode::OK {
+        tracing::debug!(status = %resp.status(), "upstream rejected ws CONNECT");
+        return generic_502();
+    }
+
+    let mut response_builder = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "upgrade")
+        .header(header::SEC_WEBSOCKET_ACCEPT, accept);
+    if let Some(p) = resp.headers().get(header::SEC_WEBSOCKET_PROTOCOL) {
+        response_builder = response_builder.header(header::SEC_WEBSOCKET_PROTOCOL, p.clone());
+    }
+    if let Some(p) = resp.headers().get(header::SEC_WEBSOCKET_EXTENSIONS) {
+        response_builder = response_builder.header(header::SEC_WEBSOCKET_EXTENSIONS, p.clone());
+    }
+
+    let on_upgrade = hyper::upgrade::on(&mut req);
+
+    let (_resp_parts, h2_recv) = resp.into_parts();
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                if let Err(e) = pipe_browser_h2(upgraded, h2_recv, send_body).await {
+                    tracing::debug!(error = %e, "ws pipe ended");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "browser upgrade failed");
+            }
+        }
+    });
+
+    response_builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| generic_502())
+}
+
+async fn pipe_browser_h2(
+    upgraded: hyper::upgrade::Upgraded,
+    h2_recv: h2::RecvStream,
+    h2_send: h2::SendStream<Bytes>,
+) -> Result<()> {
+    let upgraded = TokioIo::new(upgraded);
+    let (read_half, write_half) = tokio::io::split(upgraded);
+    let a = tokio::spawn(ws_copy_h2_to_writer(h2_recv, write_half));
+    let b = tokio::spawn(ws_copy_reader_to_h2(read_half, h2_send));
+    tokio::select! {
+        _ = a => {}
+        _ = b => {}
+    }
+    Ok(())
+}
+
+async fn ws_copy_h2_to_writer(
+    mut recv: h2::RecvStream,
+    mut w: tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>,
+) -> Result<()> {
+    while let Some(chunk) = recv.data().await {
+        let chunk = chunk.context("h2 recv data")?;
+        let len = chunk.len();
+        if !chunk.is_empty() {
+            w.write_all(&chunk).await.context("write to browser")?;
+        }
+        let _ = recv.flow_control().release_capacity(len);
+    }
+    let _ = w.shutdown().await;
+    Ok(())
+}
+
+async fn ws_copy_reader_to_h2(
+    mut r: tokio::io::ReadHalf<TokioIo<hyper::upgrade::Upgraded>>,
+    mut send: h2::SendStream<Bytes>,
+) -> Result<()> {
+    let mut buf = vec![0u8; WS_PIPE_BUF];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) => {
+                let _ = send.send_data(Bytes::new(), true);
+                return Ok(());
+            }
+            Ok(n) => n,
+            Err(e) => return Err(e.into()),
+        };
+        proto::send_h2_with_backpressure(&mut send, Bytes::copy_from_slice(&buf[..n]), false)
+            .await
+            .context("forward to h2 send")?;
+    }
 }
 
 fn is_hop_by_hop(name: &str) -> bool {

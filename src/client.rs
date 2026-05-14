@@ -1,18 +1,25 @@
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use bytes::Bytes;
 use clap::Args as ClapArgs;
-use http_body_util::{combinators::BoxBody, BodyExt};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty};
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
+use rand::RngCore;
 use rustls_pki_types::ServerName;
 use serde::Deserialize;
+use sha1::{Digest, Sha1};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
 use crate::proto::{self, AuthReply, Prelude};
 use crate::tls;
+
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_PIPE_BUF: usize = 16 * 1024;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -96,7 +103,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
     tracing::info!("data plane attached");
 
-    let mut h2_conn = h2::server::handshake(tls)
+    // Enable Extended CONNECT (RFC 8441) so we can accept WebSocket-over-HTTP/2 streams.
+    let mut h2_conn = h2::server::Builder::new()
+        .enable_connect_protocol()
+        .handshake(tls)
         .await
         .context("h2 server handshake")?;
 
@@ -121,6 +131,25 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 async fn handle_request(
+    h2_req: http::Request<h2::RecvStream>,
+    respond: h2::server::SendResponse<Bytes>,
+    local: &str,
+) -> Result<()> {
+    // Detect Extended CONNECT (WebSocket-over-HTTP/2).
+    let is_ws = h2_req.method() == http::Method::CONNECT
+        && h2_req
+            .extensions()
+            .get::<h2::ext::Protocol>()
+            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+    if is_ws {
+        handle_ws(h2_req, respond, local).await
+    } else {
+        handle_http(h2_req, respond, local).await
+    }
+}
+
+async fn handle_http(
     h2_req: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     local: &str,
@@ -230,6 +259,199 @@ async fn handle_request(
         .await
         .context("send_data end")?;
     Ok(())
+}
+
+/// Bridge an h2 Extended CONNECT (RFC 8441) stream to an HTTP/1.1 WebSocket upstream.
+///
+/// Procedure: open an HTTP/1.1 connection to the upstream, send a fresh
+/// `Upgrade: websocket` handshake with our own Sec-WebSocket-Key (the server
+/// already authenticated the browser's handshake), take ownership of the raw
+/// upgraded socket on a 101, then pipe bytes between the h2 stream and that
+/// socket in both directions.
+async fn handle_ws(
+    h2_req: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    local: &str,
+) -> Result<()> {
+    let stream = TcpStream::connect(local)
+        .await
+        .context("connect upstream for ws")?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("http1 handshake (ws)")?;
+    // Drive the upstream connection and keep upgrades alive.
+    tokio::spawn(async move {
+        if let Err(e) = conn.with_upgrades().await {
+            tracing::debug!(error = %e, "ws upstream conn ended");
+        }
+    });
+
+    let (parts, h2_body) = h2_req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/".into());
+    let local_uri: Uri = path_and_query
+        .parse()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+    let host_hdr = parts
+        .uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| String::from("localhost"));
+
+    let key = new_ws_key();
+
+    let mut builder = Request::builder()
+        .method(http::Method::GET)
+        .uri(local_uri)
+        .header(http::header::HOST, host_hdr)
+        .header(http::header::CONNECTION, "Upgrade")
+        .header(http::header::UPGRADE, "websocket")
+        .header(http::header::SEC_WEBSOCKET_KEY, &key)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13");
+
+    for (k, v) in &parts.headers {
+        let name = k.as_str();
+        // Don't double up on the headers we just set, and skip h2 pseudo-headers
+        // and hop-by-hop stuff.
+        if name.starts_with(':')
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "host"
+                    | "connection"
+                    | "upgrade"
+                    | "sec-websocket-key"
+                    | "sec-websocket-version"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "te"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "trailers"
+            )
+        {
+            continue;
+        }
+        builder = builder.header(name, v.clone());
+    }
+
+    let upstream_req = builder
+        .body(Empty::<Bytes>::new())
+        .context("build upstream ws request")?;
+    let upstream_resp = sender
+        .send_request(upstream_req)
+        .await
+        .context("send upstream ws request")?;
+
+    if upstream_resp.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        // Upstream refused the upgrade. Bubble the failure back as a non-200
+        // h2 response so the browser sees an error.
+        let status = upstream_resp.status();
+        tracing::debug!(%status, "upstream did not switch protocols");
+        let h2_resp = http::Response::builder()
+            .status(http::StatusCode::BAD_GATEWAY)
+            .body(())
+            .context("build h2 502 response")?;
+        let mut send_body = respond.send_response(h2_resp, false).ok().context("send 502")?;
+        let _ = proto::send_h2_with_backpressure(&mut send_body, Bytes::new(), true).await;
+        return Ok(());
+    }
+
+    // Capture sec-websocket-protocol / extensions before we lose access to headers.
+    let mut h2_resp_builder = http::Response::builder().status(http::StatusCode::OK);
+    for h in [
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::header::SEC_WEBSOCKET_EXTENSIONS,
+    ] {
+        if let Some(v) = upstream_resp.headers().get(&h) {
+            h2_resp_builder = h2_resp_builder.header(h, v.clone());
+        }
+    }
+
+    // Take ownership of the raw upgraded TCP stream.
+    let upgraded = hyper::upgrade::on(upstream_resp)
+        .await
+        .context("hyper upgrade (upstream)")?;
+
+    let h2_resp = h2_resp_builder.body(()).context("build h2 200 response")?;
+    let send_body = respond
+        .send_response(h2_resp, false)
+        .context("send h2 200 (ws)")?;
+
+    pipe_ws(h2_body, send_body, upgraded).await
+}
+
+async fn pipe_ws(
+    h2_recv: h2::RecvStream,
+    h2_send: h2::SendStream<Bytes>,
+    upgraded: hyper::upgrade::Upgraded,
+) -> Result<()> {
+    let upgraded = TokioIo::new(upgraded);
+    let (read_half, write_half) = tokio::io::split(upgraded);
+    let a = tokio::spawn(copy_h2_to_writer(h2_recv, write_half));
+    let b = tokio::spawn(copy_reader_to_h2(read_half, h2_send));
+    // When either side finishes, abort the other so we don't keep a half-open pipe forever.
+    tokio::select! {
+        _ = a => {}
+        _ = b => {}
+    }
+    Ok(())
+}
+
+async fn copy_h2_to_writer(
+    mut recv: h2::RecvStream,
+    mut w: tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>,
+) -> Result<()> {
+    while let Some(chunk) = recv.data().await {
+        let chunk = chunk.context("h2 recv data")?;
+        let len = chunk.len();
+        if !chunk.is_empty() {
+            w.write_all(&chunk).await.context("write to upstream")?;
+        }
+        let _ = recv.flow_control().release_capacity(len);
+    }
+    let _ = w.shutdown().await;
+    Ok(())
+}
+
+async fn copy_reader_to_h2(
+    mut r: tokio::io::ReadHalf<TokioIo<hyper::upgrade::Upgraded>>,
+    mut send: h2::SendStream<Bytes>,
+) -> Result<()> {
+    let mut buf = vec![0u8; WS_PIPE_BUF];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) => {
+                let _ = send.send_data(Bytes::new(), true);
+                return Ok(());
+            }
+            Ok(n) => n,
+            Err(e) => return Err(e.into()),
+        };
+        proto::send_h2_with_backpressure(&mut send, Bytes::copy_from_slice(&buf[..n]), false)
+            .await
+            .context("forward to h2 send")?;
+    }
+}
+
+fn new_ws_key() -> String {
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    base64::engine::general_purpose::STANDARD.encode(buf)
+}
+
+/// Compute Sec-WebSocket-Accept from a Sec-WebSocket-Key per RFC 6455.
+#[allow(dead_code)]
+pub fn ws_accept(key: &str) -> String {
+    let mut h = Sha1::new();
+    h.update(key.as_bytes());
+    h.update(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
 }
 
 use futures_util::StreamExt;
