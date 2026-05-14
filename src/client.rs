@@ -357,7 +357,10 @@ async fn handle_ws(
             .status(http::StatusCode::BAD_GATEWAY)
             .body(())
             .context("build h2 502 response")?;
-        let mut send_body = respond.send_response(h2_resp, false).ok().context("send 502")?;
+        let mut send_body = respond
+            .send_response(h2_resp, false)
+            .ok()
+            .context("send 502")?;
         let _ = proto::send_h2_with_backpressure(&mut send_body, Bytes::new(), true).await;
         return Ok(());
     }
