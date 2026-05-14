@@ -94,17 +94,40 @@ case "$os" in
   darwin) name="tunneld-darwin-${arch}" ;;
   *) echo "unsupported os: $os; for windows fetch tunneld-windows-${arch}.exe manually" >&2; exit 1 ;;
 esac
-echo "downloading ${BASE}/dl/${name} -> ${DEST}"
+
+# Download to an unprivileged temp file so the only privileged step is the mv.
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT INT TERM
+
+echo "downloading ${BASE}/dl/${name}"
 if command -v curl >/dev/null 2>&1; then
-  curl -fSL "${BASE}/dl/${name}" -o "${DEST}.tmp"
+  curl -fSL "${BASE}/dl/${name}" -o "$TMP"
 elif command -v wget >/dev/null 2>&1; then
-  wget -O "${DEST}.tmp" "${BASE}/dl/${name}"
+  wget -O "$TMP" "${BASE}/dl/${name}"
 else
   echo "need curl or wget" >&2; exit 1
 fi
-chmod +x "${DEST}.tmp"
-mv "${DEST}.tmp" "${DEST}"
-"${DEST}" --version
+chmod +x "$TMP"
+
+# Escalate only if the destination isn't writable as the current user.
+SUDO=""
+DEST_DIR=$(dirname "$DEST")
+if [ -w "$DEST_DIR" ] || { [ -e "$DEST" ] && [ -w "$DEST" ]; }; then
+  echo "installing -> ${DEST}"
+else
+  if command -v sudo >/dev/null 2>&1; then
+    echo "installing -> ${DEST} (requires sudo)"
+    SUDO="sudo"
+  else
+    echo "cannot write to ${DEST} and sudo is not available" >&2
+    echo "re-run with TUNNELD_INSTALL_DEST=<writable-path> or as root" >&2
+    exit 1
+  fi
+fi
+$SUDO mv "$TMP" "$DEST"
+trap - EXIT INT TERM
+
+"$DEST" --version
 "#;
 
 struct TunnelHandle {
