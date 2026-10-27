@@ -1,6 +1,8 @@
 image: docker:latest
 services:
-  - docker:dind
+  - name: docker:dind
+    alias: docker
+    command: ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://127.0.0.1:2375", "--tls=false"]
 
 stages:
   - test
