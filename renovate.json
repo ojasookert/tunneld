@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":timezone(Europe/Tallinn)",
+    ":semanticCommits"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "on monday"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "Rust crates: minor and patch together, weekly",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Rust crates",
+      "schedule": [
+        "on monday"
+      ]
+    },
+    {
+      "description": "CI images: minor, patch and digests together, weekly",
+      "matchManagers": [
+        "gitlabci"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "CI images",
+      "schedule": [
+        "on monday"
+      ]
+    }
+  ]
+}
