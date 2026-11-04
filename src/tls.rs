@@ -3,14 +3,13 @@ use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     ClientConfig, RootCertStore, ServerConfig, SignatureScheme,
 };
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::{fmt, fs, path::Path, sync::Arc};
 
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let data = fs::read(path).with_context(|| format!("read cert {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&data[..]);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-        .collect::<std::io::Result<Vec<_>>>()
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&data)
+        .collect::<Result<Vec<_>, _>>()
         .context("parse cert PEM")?;
     if certs.is_empty() {
         return Err(anyhow!("no certs in {}", path.display()));
@@ -20,11 +19,13 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let data = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&data[..]);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .context("parse key PEM")?
-        .ok_or_else(|| anyhow!("no key in {}", path.display()))?;
-    Ok(key)
+    match PrivateKeyDer::from_pem_slice(&data) {
+        Ok(key) => Ok(key),
+        Err(rustls_pki_types::pem::Error::NoItemsFound) => {
+            Err(anyhow!("no key in {}", path.display()))
+        }
+        Err(e) => Err(e).context("parse key PEM"),
+    }
 }
 
 pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
