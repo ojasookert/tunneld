@@ -24,7 +24,7 @@ RUN cargo build --release --target aarch64-unknown-linux-gnu \
  && aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/tunneld \
  && x86_64-w64-mingw32-strip target/x86_64-pc-windows-gnu/release/tunneld.exe
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 
 COPY --from=prod-builder /build/target/release/tunneld /usr/local/bin/tunneld
