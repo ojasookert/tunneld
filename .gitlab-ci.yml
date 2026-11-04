@@ -1,6 +1,6 @@
-image: docker:latest
+image: docker:29.9.2-cli
 services:
-  - name: docker:dind
+  - name: docker:29.9.2-dind
     alias: docker
     command: ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://127.0.0.1:2375", "--tls=false"]
 
@@ -13,6 +13,8 @@ variables:
   COMMIT_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
+  # Attestation manifests race on registry.le.ht ("blob unknown to registry").
+  BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
 
 test:
   stage: test
