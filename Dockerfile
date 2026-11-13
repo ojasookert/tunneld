@@ -1,4 +1,4 @@
-FROM rust:1.95-alpine AS prod-builder
+FROM rust:1.100-alpine AS prod-builder
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -6,7 +6,7 @@ COPY src ./src
 RUN cargo build --release \
  && strip target/release/tunneld
 
-FROM rust:1.95-bookworm AS cross-builder
+FROM rust:1.100-bookworm AS cross-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-aarch64-linux-gnu \
         libc6-dev-arm64-cross \
