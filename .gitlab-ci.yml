@@ -1,6 +1,6 @@
-image: docker:29.9.2-cli
+image: docker:29.9.3-cli
 services:
-  - name: docker:29.9.2-dind
+  - name: docker:29.9.3-dind
     alias: docker
     command: ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://127.0.0.1:2375", "--tls=false"]
 
@@ -18,7 +18,7 @@ variables:
 
 test:
   stage: test
-  image: rust:1.95-bookworm
+  image: rust:1.100-bookworm
   before_script:
     - rustup component add rustfmt clippy
     - cargo install --quiet --locked cargo-audit
